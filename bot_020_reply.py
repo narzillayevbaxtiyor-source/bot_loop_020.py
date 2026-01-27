@@ -1,31 +1,34 @@
 import os
-import asyncio
-from telegram import Bot
+import requests
+import time
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID"))
+GROUP_CHAT_ID = os.getenv("GROUP_CHAT_ID")
 
-bot = Bot(token=BOT_TOKEN)
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-async def send_ticker(ticker: str):
+def send_message(text, reply_to=None):
+    payload = {
+        "chat_id": GROUP_CHAT_ID,
+        "text": text
+    }
+    if reply_to:
+        payload["reply_to_message_id"] = reply_to
+
+    r = requests.post(f"{API}/sendMessage", json=payload, timeout=20)
+    r.raise_for_status()
+    return r.json()["result"]["message_id"]
+
+def send_ticker_with_reply(ticker: str):
     ticker = ticker.upper().strip()
 
-    # 1️⃣ oddiy ticker yuboriladi
-    msg = await bot.send_message(
-        chat_id=GROUP_CHAT_ID,
-        text=ticker
-    )
+    # 1️⃣ oddiy ticker
+    msg_id = send_message(ticker)
+    time.sleep(1)
 
-    # 2️⃣ o‘sha xabarga REPLY qilib yana ticker yuboriladi
-    await bot.send_message(
-        chat_id=GROUP_CHAT_ID,
-        text=ticker,
-        reply_to_message_id=msg.message_id
-    )
-
-async def main():
-    # test
-    await send_ticker("BTC")
+    # 2️⃣ o‘sha xabarga reply qilib yana ticker
+    send_message(ticker, reply_to=msg_id)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # TEST
+    send_ticker_with_reply("BTC")
