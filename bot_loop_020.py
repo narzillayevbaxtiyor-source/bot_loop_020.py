@@ -2,27 +2,27 @@ import os
 import time
 import json
 import requests
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
-print("### BOT_LOOP_020 RUNNING — TICKER ONLY (NO USDT) — NO UPDATER ###", flush=True)
+print("### BOT_LOOP_020 RUNNING — 4H HIGH TRIGGER — TICKER ONLY ###", flush=True)
 
 # =========================
 # CONFIG (ENV)
 # =========================
 BINANCE_BASE_URL = os.getenv("BINANCE_BASE_URL", "https://data-api.binance.vision").strip()
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
+POLL_SECONDS = int(os.getenv("POLL_SECONDS", "20"))
 
-# Trigger: 24h HIGH ga qolgan masofa (%)
+# Trigger: 4H HIGH ga qolgan masofa (%)
 TRIGGER_PCT = float(os.getenv("TRIGGER_PCT", "0.20"))  # 0.20%
 
 # Cooldown: bitta symbol qayta yuborilmasin (sekund)
 COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", str(30 * 60)))  # default 30 min
 
 # Filters
-MIN_QUOTE_VOL = float(os.getenv("MIN_QUOTE_VOL", "2000000"))  # USDT quoteVolume filter
+MIN_QUOTE_VOL_24H = float(os.getenv("MIN_QUOTE_VOL_24H", "2000000"))  # 24h quoteVolume filter
 ONLY_USDT = os.getenv("ONLY_USDT", "1") == "1"
-PAIR_SUFFIX = os.getenv("PAIR_SUFFIX", "USDT")  # ichki ishlash uchun
+PAIR_SUFFIX = os.getenv("PAIR_SUFFIX", "USDT")
 
 # Universe refresh
 SPOT_REFRESH_SECONDS = int(os.getenv("SPOT_REFRESH_SECONDS", "3600"))
@@ -52,7 +52,6 @@ def fetch_json(url: str, params=None):
     return r.json()
 
 def tg_send(text: str):
-    """Telegram guruhga xabar yuboradi. Agar token/chat yo'q bo'lsa logga yozadi."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("[NO TELEGRAM ENV]", text, flush=True)
         return
@@ -92,20 +91,38 @@ def is_bad_symbol(sym: str) -> bool:
         return True
     return False
 
-def remain_pct_to_high(last_price: float, high_price: float) -> float:
-    if high_price <= 0:
-        return 999.0
-    return ((high_price - last_price) / high_price) * 100.0
-
 def clean_ticker(sym: str) -> str:
-    """BTCUSDT -> BTC (faqat oxiridagi USDT ni olib tashlaydi)"""
+    # BTCUSDT -> BTC (faqat oxiridagi USDTni olib tashlaydi)
     if sym.endswith(PAIR_SUFFIX):
         return sym[: -len(PAIR_SUFFIX)]
     return sym
 
-def parse_24hr(t: dict) -> Tuple[float, float, float]:
-    # lastPrice, highPrice, quoteVolume
-    return float(t["lastPrice"]), float(t["highPrice"]), float(t.get("quoteVolume", "0") or "0")
+def get_last_price(sym: str) -> Optional[float]:
+    d = fetch_json(f"{BINANCE_BASE_URL}/api/v3/ticker/price", {"symbol": sym})
+    try:
+        return float(d["price"])
+    except Exception:
+        return None
+
+def get_4h_high(sym: str) -> Optional[float]:
+    """
+    Joriy 4H shamning high'i:
+    Binance klines limit=1 qaytargani current ongoing candle bo'ladi.
+    """
+    kl = fetch_json(f"{BINANCE_BASE_URL}/api/v3/klines", {"symbol": sym, "interval": "4h", "limit": 1})
+    if not kl:
+        return None
+    k = kl[0]
+    try:
+        high_price = float(k[2])  # high
+        return high_price
+    except Exception:
+        return None
+
+def remain_pct_to_high(price: float, high_price: float) -> float:
+    if high_price <= 0:
+        return 999.0
+    return ((high_price - price) / high_price) * 100.0
 
 # =========================
 # SPOT USDT UNIVERSE
@@ -150,6 +167,26 @@ def refresh_universe_if_needed(state: Dict) -> List[str]:
     return out
 
 # =========================
+# 24H VOLUME MAP (1 call)
+# =========================
+def fetch_24h_volume_map() -> Dict[str, float]:
+    """
+    rate-limitni kamaytirish uchun bitta call:
+    /api/v3/ticker/24hr -> symbol, quoteVolume
+    """
+    tickers = fetch_json(f"{BINANCE_BASE_URL}/api/v3/ticker/24hr")
+    vmap: Dict[str, float] = {}
+    for t in tickers:
+        sym = t.get("symbol")
+        if not sym:
+            continue
+        try:
+            vmap[sym] = float(t.get("quoteVolume", "0") or "0")
+        except Exception:
+            vmap[sym] = 0.0
+    return vmap
+
+# =========================
 # MAIN LOOP
 # =========================
 def main():
@@ -158,9 +195,12 @@ def main():
 
     state = load_state()
     symbols = refresh_universe_if_needed(state)
-
     scan_index = 0
-    tg_send("✅ 0.20% bot ishga tushdi. Guruhga faqat ticker yuboradi (USDTsiz).")
+
+    tg_send("✅ 0.20% bot ishga tushdi. Trigger: 4H HIGH ga yaqinlashsa. Guruhga faqat ticker (USDTsiz).")
+
+    last_vol_fetch = 0.0
+    vol_map: Dict[str, float] = {}
 
     while True:
         try:
@@ -170,9 +210,11 @@ def main():
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # 24hr tickers (1 call)
-            tickers = fetch_json(f"{BINANCE_BASE_URL}/api/v3/ticker/24hr")
-            tmap = {t.get("symbol"): t for t in tickers if t.get("symbol")}
+            # 24h volume map (har 3 daqiqada yangilab turamiz)
+            now = time.time()
+            if (now - last_vol_fetch) > 180 or not vol_map:
+                vol_map = fetch_24h_volume_map()
+                last_vol_fetch = now
 
             # batch selection
             batch: List[str] = []
@@ -180,25 +222,22 @@ def main():
                 batch.append(symbols[scan_index])
                 scan_index = (scan_index + 1) % len(symbols)
 
-            now = time.time()
             last_sent_ts: Dict[str, float] = state.get("last_sent_ts", {})
 
             for sym in batch:
-                t = tmap.get(sym)
-                if not t:
+                # volume filter
+                if vol_map.get(sym, 0.0) < MIN_QUOTE_VOL_24H:
                     continue
 
-                try:
-                    last_price, high_price, quote_vol = parse_24hr(t)
-                except Exception:
+                price = get_last_price(sym)
+                if price is None or price <= 0:
                     continue
 
-                if quote_vol < MIN_QUOTE_VOL:
-                    continue
-                if last_price <= 0 or high_price <= 0:
+                high_4h = get_4h_high(sym)
+                if high_4h is None or high_4h <= 0:
                     continue
 
-                rp = remain_pct_to_high(last_price, high_price)
+                rp = remain_pct_to_high(price, high_4h)
                 if rp < 0:
                     continue
 
@@ -207,7 +246,7 @@ def main():
                     if (now - last) < COOLDOWN_SECONDS:
                         continue
 
-                    # ✅ Guruhga faqat ticker (USDTsiz)
+                    # ✅ guruhga faqat ticker (USDTsiz)
                     tg_send(clean_ticker(sym))
 
                     last_sent_ts[sym] = now
