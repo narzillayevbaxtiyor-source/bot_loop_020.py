@@ -2,12 +2,9 @@ import os
 import time
 import json
 import requests
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
-# =========================
-# START FINGERPRINT
-# =========================
-print("### BOT_LOOP_020 RUNNING — NO UPDATER — OK ###", flush=True)
+print("### BOT_LOOP_020 RUNNING — TICKER ONLY (NO USDT) — NO UPDATER ###", flush=True)
 
 # =========================
 # CONFIG (ENV)
@@ -25,7 +22,7 @@ COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", str(30 * 60)))  # default 3
 # Filters
 MIN_QUOTE_VOL = float(os.getenv("MIN_QUOTE_VOL", "2000000"))  # USDT quoteVolume filter
 ONLY_USDT = os.getenv("ONLY_USDT", "1") == "1"
-PAIR_SUFFIX = os.getenv("PAIR_SUFFIX", "USDT")
+PAIR_SUFFIX = os.getenv("PAIR_SUFFIX", "USDT")  # ichki ishlash uchun
 
 # Universe refresh
 SPOT_REFRESH_SECONDS = int(os.getenv("SPOT_REFRESH_SECONDS", "3600"))
@@ -37,7 +34,7 @@ SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "25"))
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-# State file (Render diskida saqlanadi; redeploy bo'lsa yangidan boshlashi mumkin)
+# State file
 STATE_FILE = os.getenv("STATE_FILE", "state_loop_020.json").strip()
 
 # Blacklists
@@ -55,6 +52,7 @@ def fetch_json(url: str, params=None):
     return r.json()
 
 def tg_send(text: str):
+    """Telegram guruhga xabar yuboradi. Agar token/chat yo'q bo'lsa logga yozadi."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         print("[NO TELEGRAM ENV]", text, flush=True)
         return
@@ -72,10 +70,6 @@ def tg_send(text: str):
     if r.status_code != 200:
         print("[TELEGRAM ERROR]", r.status_code, r.text, flush=True)
 
-def kline_to_ohlc_24hr(t: dict) -> Tuple[float, float, float]:
-    # lastPrice, highPrice, quoteVolume
-    return float(t["lastPrice"]), float(t["highPrice"]), float(t.get("quoteVolume", "0") or "0")
-
 def load_state() -> Dict:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -92,7 +86,7 @@ def save_state(st: Dict):
 def is_bad_symbol(sym: str) -> bool:
     if sym in STABLE_STABLE:
         return True
-    if not sym.endswith(PAIR_SUFFIX):
+    if ONLY_USDT and not sym.endswith(PAIR_SUFFIX):
         return True
     if any(x in sym for x in BAD_PARTS):
         return True
@@ -102,6 +96,16 @@ def remain_pct_to_high(last_price: float, high_price: float) -> float:
     if high_price <= 0:
         return 999.0
     return ((high_price - last_price) / high_price) * 100.0
+
+def clean_ticker(sym: str) -> str:
+    """BTCUSDT -> BTC (faqat oxiridagi USDT ni olib tashlaydi)"""
+    if sym.endswith(PAIR_SUFFIX):
+        return sym[: -len(PAIR_SUFFIX)]
+    return sym
+
+def parse_24hr(t: dict) -> Tuple[float, float, float]:
+    # lastPrice, highPrice, quoteVolume
+    return float(t["lastPrice"]), float(t["highPrice"]), float(t.get("quoteVolume", "0") or "0")
 
 # =========================
 # SPOT USDT UNIVERSE
@@ -120,8 +124,6 @@ def refresh_universe_if_needed(state: Dict) -> List[str]:
     for s in info.get("symbols", []):
         sym = s.get("symbol", "")
         if not sym:
-            continue
-        if ONLY_USDT and not sym.endswith(PAIR_SUFFIX):
             continue
         if is_bad_symbol(sym):
             continue
@@ -158,7 +160,7 @@ def main():
     symbols = refresh_universe_if_needed(state)
 
     scan_index = 0
-    tg_send("✅ 0.20% bot (loop) ishga tushdi. Faqat ticker yuboradi. (NO UPDATER)")
+    tg_send("✅ 0.20% bot ishga tushdi. Guruhga faqat ticker yuboradi (USDTsiz).")
 
     while True:
         try:
@@ -168,13 +170,11 @@ def main():
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # 24hr tickers (1 call) — tezroq
+            # 24hr tickers (1 call)
             tickers = fetch_json(f"{BINANCE_BASE_URL}/api/v3/ticker/24hr")
-
-            # symbol -> ticker map
             tmap = {t.get("symbol"): t for t in tickers if t.get("symbol")}
 
-            # batch
+            # batch selection
             batch: List[str] = []
             for _ in range(min(SCAN_BATCH_SIZE, len(symbols))):
                 batch.append(symbols[scan_index])
@@ -183,14 +183,13 @@ def main():
             now = time.time()
             last_sent_ts: Dict[str, float] = state.get("last_sent_ts", {})
 
-            # scan
             for sym in batch:
                 t = tmap.get(sym)
                 if not t:
                     continue
 
                 try:
-                    last_price, high_price, quote_vol = kline_to_ohlc_24hr(t)
+                    last_price, high_price, quote_vol = parse_24hr(t)
                 except Exception:
                     continue
 
@@ -203,19 +202,17 @@ def main():
                 if rp < 0:
                     continue
 
-                # trigger
                 if rp <= TRIGGER_PCT:
                     last = float(last_sent_ts.get(sym, 0.0))
                     if (now - last) < COOLDOWN_SECONDS:
                         continue
 
-                    # 🔹 faqat ticker yuboriladi (USDT olib tashlanadi)
-    clean_ticker = sym.replace(PAIR_SUFFIX, "")
-    tg_send(clean_ticker)
+                    # ✅ Guruhga faqat ticker (USDTsiz)
+                    tg_send(clean_ticker(sym))
 
-    last_sent_ts[sym] = now
-    state["last_sent_ts"] = last_sent_ts
-    save_state(state)
+                    last_sent_ts[sym] = now
+                    state["last_sent_ts"] = last_sent_ts
+                    save_state(state)
 
             time.sleep(POLL_SECONDS)
 
