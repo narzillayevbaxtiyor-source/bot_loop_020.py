@@ -209,11 +209,13 @@ def main():
                     if (now - last) < COOLDOWN_SECONDS:
                         continue
 
-                    # groupga faqat ticker
-                    tg_send(sym)
-                    last_sent_ts[sym] = now
-                    state["last_sent_ts"] = last_sent_ts
-                    save_state(state)
+                    # 🔹 faqat ticker yuboriladi (USDT olib tashlanadi)
+    clean_ticker = sym.replace(PAIR_SUFFIX, "")
+    tg_send(clean_ticker)
+
+    last_sent_ts[sym] = now
+    state["last_sent_ts"] = last_sent_ts
+    save_state(state)
 
             time.sleep(POLL_SECONDS)
 
