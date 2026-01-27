@@ -4,7 +4,7 @@ import json
 import requests
 from typing import Dict, List, Tuple, Optional
 
-print("### BOT_LOOP_020 RUNNING — 4H HIGH TRIGGER — TICKER ONLY ###", flush=True)
+print("### BOT_LOOP_020 RUNNING — 4H HIGH TRIGGER — MENTION HUKM BOT — TICKER ONLY ###", flush=True)
 
 # =========================
 # CONFIG (ENV)
@@ -33,6 +33,11 @@ SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "25"))
 # Telegram (HTTP API)
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# Tekshiruvchi bot username (mention uchun)
+HUKM_BOT_USERNAME = os.getenv("HUKM_BOT_USERNAME", "@HukmCrypto_bot").strip()
+if HUKM_BOT_USERNAME and not HUKM_BOT_USERNAME.startswith("@"):
+    HUKM_BOT_USERNAME = "@" + HUKM_BOT_USERNAME
 
 # State file
 STATE_FILE = os.getenv("STATE_FILE", "state_loop_020.json").strip()
@@ -92,7 +97,7 @@ def is_bad_symbol(sym: str) -> bool:
     return False
 
 def clean_ticker(sym: str) -> str:
-    # BTCUSDT -> BTC (faqat oxiridagi USDTni olib tashlaydi)
+    # BTCUSDT -> BTC
     if sym.endswith(PAIR_SUFFIX):
         return sym[: -len(PAIR_SUFFIX)]
     return sym
@@ -106,16 +111,14 @@ def get_last_price(sym: str) -> Optional[float]:
 
 def get_4h_high(sym: str) -> Optional[float]:
     """
-    Joriy 4H shamning high'i:
-    Binance klines limit=1 qaytargani current ongoing candle bo'ladi.
+    Joriy 4H shamning high'i (ongoing candle):
+    /api/v3/klines limit=1 -> current candle.
     """
     kl = fetch_json(f"{BINANCE_BASE_URL}/api/v3/klines", {"symbol": sym, "interval": "4h", "limit": 1})
     if not kl:
         return None
-    k = kl[0]
     try:
-        high_price = float(k[2])  # high
-        return high_price
+        return float(kl[0][2])  # high
     except Exception:
         return None
 
@@ -170,10 +173,6 @@ def refresh_universe_if_needed(state: Dict) -> List[str]:
 # 24H VOLUME MAP (1 call)
 # =========================
 def fetch_24h_volume_map() -> Dict[str, float]:
-    """
-    rate-limitni kamaytirish uchun bitta call:
-    /api/v3/ticker/24hr -> symbol, quoteVolume
-    """
     tickers = fetch_json(f"{BINANCE_BASE_URL}/api/v3/ticker/24hr")
     vmap: Dict[str, float] = {}
     for t in tickers:
@@ -197,21 +196,21 @@ def main():
     symbols = refresh_universe_if_needed(state)
     scan_index = 0
 
-    tg_send("✅ 0.20% bot ishga tushdi. Trigger: 4H HIGH ga yaqinlashsa. Guruhga faqat ticker (USDTsiz).")
+    tg_send("✅ 0.20% bot ishga tushdi. Trigger: 4H HIGH ga yaqinlashsa. Guruhga: @HukmCrypto_bot TICKER")
 
     last_vol_fetch = 0.0
     vol_map: Dict[str, float] = {}
 
     while True:
         try:
-            # refresh universe
             symbols = refresh_universe_if_needed(state)
             if not symbols:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # 24h volume map (har 3 daqiqada yangilab turamiz)
             now = time.time()
+
+            # 24h volume map (har 3 daqiqada yangilanadi)
             if (now - last_vol_fetch) > 180 or not vol_map:
                 vol_map = fetch_24h_volume_map()
                 last_vol_fetch = now
@@ -246,8 +245,9 @@ def main():
                     if (now - last) < COOLDOWN_SECONDS:
                         continue
 
-                    # ✅ guruhga faqat ticker (USDTsiz)
-                    tg_send(clean_ticker(sym))
+                    ticker = clean_ticker(sym)
+                    # ✅ Tekshiruvchi bot albatta ko'rishi uchun mention + ticker
+                    tg_send(f"{HUKM_BOT_USERNAME} {ticker}")
 
                     last_sent_ts[sym] = now
                     state["last_sent_ts"] = last_sent_ts
