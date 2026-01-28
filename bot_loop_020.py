@@ -1,198 +1,241 @@
 import os
+import json
 import time
-import requests
-from typing import List, Dict, Optional
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, Optional, List
 
-# =========================
-# ENV / CONFIG
-# =========================
-BINANCE_BASE_URL = (os.getenv("BINANCE_BASE_URL") or "https://data-api.binance.vision").strip()
+import aiohttp
+from telegram import Update
+from telegram.constants import ParseMode
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))          # har nechchi sekundda batch aylansin
-SCAN_BATCH_SIZE = int(os.getenv("SCAN_BATCH_SIZE", "25"))    # nechta sym bir aylanishda
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("setup-bot")
 
-SPOT_REFRESH_SECONDS = int(os.getenv("SPOT_REFRESH_SECONDS", "3600"))
+# ===================== ENV =====================
+BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
+CHAT_ID = (os.getenv("CHAT_ID") or "").strip()  # -100... (group) yoki 6248061970 (user)
+SYMBOLS_RAW = (os.getenv("SYMBOLS") or "BTCUSDT").strip()  # comma separated
+INTERVAL = (os.getenv("INTERVAL") or "3m").strip()
+SCAN_LOG_EVERY_SEC = int(os.getenv("SCAN_LOG_EVERY_SEC") or "0")  # 0 = off
+BINANCE_WS_BASE = (os.getenv("BINANCE_WS_BASE") or "wss://stream.binance.com:9443").strip()
+# Alternativ: wss://data-stream.binance.vision
 
-# 4H high ga qolgan masofa (%)
-TRIGGER_PCT = float(os.getenv("TRIGGER_PCT", "0.20"))        # 0.20%
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN env yo‘q")
+if not CHAT_ID:
+    raise RuntimeError("CHAT_ID env yo‘q")
 
-# bir coin qayta-qayta kelmasin (sekund)
-COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "1800"))  # 30 min
+SYMBOLS = [s.strip().upper() for s in SYMBOLS_RAW.split(",") if s.strip()]
+if not SYMBOLS:
+    raise RuntimeError("SYMBOLS bo‘sh")
 
-# Filterlar
-ONLY_USDT = (os.getenv("ONLY_USDT", "1").strip() == "1")
-MIN_QUOTE_VOL = float(os.getenv("MIN_QUOTE_VOL", "0"))         # xohlasang: 2000000
-PAIR_SUFFIX = (os.getenv("PAIR_SUFFIX") or "USDT").strip().upper()
+# ===================== STRATEGY STATE =====================
+def is_green(open_: float, close: float) -> bool:
+    # sizning A javobingiz: close >= open ham yashil (doji ham yashil)
+    return close >= open_
 
-# Telegram
-TELEGRAM_TOKEN = (os.getenv("TELEGRAM_TOKEN") or "").strip()
-TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+def is_red(open_: float, close: float) -> bool:
+    return close < open_
 
-# Exclude
-BAD_PARTS = ("UP", "DOWN", "BULL", "BEAR", "3L", "3S", "5L", "5S")
-STABLE_STABLE = {"BUSDUSDT", "USDCUSDT", "TUSDUSDT", "FDUSDUSDT", "DAIUSDT"}
+@dataclass
+class Candle:
+    t: int
+    o: float
+    h: float
+    l: float
+    c: float
+    is_final: bool
 
-SESSION = requests.Session()
+@dataclass
+class SymbolState:
+    state: str = "SEARCH_MAKE_HIGH_START"  # SEARCH_MAKE_HIGH_START | IN_MAKE_HIGH | IN_PULLBACK | IN_BUY
+    makeHighStartLow: Optional[float] = None
+    endRedLow: Optional[float] = None
 
+    last_closed: Optional[Candle] = None      # oxirgi yopilgan sham
+    prev_closed: Optional[Candle] = None      # undan oldingi yopilgan sham
 
-# =========================
-# HELPERS
-# =========================
-def fetch_json(path: str, params=None):
-    url = f"{BINANCE_BASE_URL}{path}"
-    r = SESSION.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    return r.json()
+    cycle_no: int = 0                         # 1 BUY, 1 SELL, 2 BUY, 2 SELL...
+    last_buy_ts: Optional[int] = None
+    last_sell_ts: Optional[int] = None
 
-def tg_send(text: str):
-    # Token/chat bo'lmasa -> print
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print(text)
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    r = SESSION.post(url, json={
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "disable_web_page_preview": True
-    }, timeout=20)
-    if r.status_code != 200:
-        print("[TELEGRAM ERROR]", r.status_code, r.text)
+    # BUY dan keyin SELL uchun referens: oxirgi yopilgan sham low
+    sell_ref_low: Optional[float] = None
 
-def to_ticker(symbol: str) -> str:
-    # masalan BTCUSDT -> BTC
-    if symbol.endswith(PAIR_SUFFIX):
-        return symbol[:-len(PAIR_SUFFIX)]
-    return symbol
+STATES: Dict[str, SymbolState] = {s: SymbolState() for s in SYMBOLS}
 
-def basic_filter(sym: str) -> bool:
-    if ONLY_USDT and not sym.endswith(PAIR_SUFFIX):
-        return False
-    if sym in STABLE_STABLE:
-        return False
-    # Leveraged tokenlar: UPUSDT, DOWNUSDT, ... va ichida BULL/BEAR va 3L/3S...
-    if any(part in sym for part in BAD_PARTS):
-        return False
-    return True
+# ===================== TELEGRAM APP =====================
+app = Application.builder().token(BOT_TOKEN).build()
 
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (
+        "✅ Setup bot ishga tushdi.\n\n"
+        f"Symbols: <b>{', '.join(SYMBOLS)}</b>\n"
+        f"TF: <b>{INTERVAL}</b>\n"
+        "Signal: intrabar (A)\n\n"
+        "Buy: MakeHigh end -> Pullback -> last closed high break\n"
+        "Sell: Buy’dan keyin last closed low break"
+    )
+    await update.message.reply_text(txt, parse_mode=ParseMode.HTML)
 
-# =========================
-# UNIVERSE
-# =========================
-def load_usdt_spot_symbols() -> List[str]:
-    info = fetch_json("/api/v3/exchangeInfo")
-    out = []
-    for s in info.get("symbols", []):
-        sym = s.get("symbol", "")
-        if not sym:
-            continue
-        if s.get("status") != "TRADING":
-            continue
-        if ONLY_USDT and s.get("quoteAsset") != "USDT":
-            continue
-        if not basic_filter(sym):
-            continue
+app.add_handler(CommandHandler("start", cmd_start))
 
-        # spot permission
-        permissions = s.get("permissions", [])
-        permission_sets = s.get("permissionSets", [])
-        is_spot = ("SPOT" in permissions) or any(("SPOT" in ps) for ps in permission_sets)
-        if not is_spot:
-            continue
-
-        out.append(sym)
-
-    out.sort()
-    return out
-
-
-# =========================
-# CORE CHECK (4H HIGH remain %)
-# =========================
-def get_4h_high(symbol: str) -> Optional[float]:
-    # ongoing 4h candle (limit=1)
-    kl = fetch_json("/api/v3/klines", {"symbol": symbol, "interval": "4h", "limit": 1})
-    if not kl:
-        return None
-    high = float(kl[0][2])
-    return high if high > 0 else None
-
-def get_last_price(symbol: str) -> Optional[float]:
-    d = fetch_json("/api/v3/ticker/price", {"symbol": symbol})
-    return float(d["price"]) if "price" in d else None
-
-def get_24h_quote_volume(symbol: str) -> Optional[float]:
-    # 24h stats
-    d = fetch_json("/api/v3/ticker/24hr", {"symbol": symbol})
-    # quoteVolume = USDT hajm
+async def tg_send(text: str):
     try:
-        return float(d.get("quoteVolume", "0"))
-    except Exception:
-        return None
+        await app.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        log.warning("Telegram send error: %s", e)
 
+# ===================== CORE LOGIC =====================
+def reset_setup(st: SymbolState):
+    st.state = "SEARCH_MAKE_HIGH_START"
+    st.makeHighStartLow = None
+    st.endRedLow = None
+    st.sell_ref_low = None
 
-def main():
-    tg_send("✅ 0.20 bot: 4H high ga TRIGGER_PCT qolganda guruhga faqat TICKER yuboradi (USDTsiz).")
+def on_candle_close(symbol: str, closed: Candle):
+    st = STATES[symbol]
+    st.prev_closed = st.last_closed
+    st.last_closed = closed
 
-    symbols: List[str] = []
-    last_refresh = 0.0
-    scan_index = 0
+    # START: prev red -> last green
+    if st.state == "SEARCH_MAKE_HIGH_START" and st.prev_closed:
+        if is_red(st.prev_closed.o, st.prev_closed.c) and is_green(closed.o, closed.c):
+            st.state = "IN_MAKE_HIGH"
+            st.makeHighStartLow = closed.l
+            st.endRedLow = None
 
-    last_sent: Dict[str, float] = {}  # symbol -> ts
+    # IN_MAKE_HIGH: birinchi qizil sham candidate
+    if st.state == "IN_MAKE_HIGH":
+        if is_red(closed.o, closed.c) and st.endRedLow is None:
+            st.endRedLow = closed.l
 
+    # BUY dan keyin SELL referens har yangi yopilgan shamda yangilanadi
+    if st.state == "IN_BUY":
+        st.sell_ref_low = closed.l
+
+async def maybe_trigger_events(symbol: str, current: Candle):
+    """
+    Intrabar tekshiruv.
+    current = hozir shakllanayotgan (yopilmagan) sham ham bo‘lishi mumkin.
+    """
+    st = STATES[symbol]
+    lc = st.last_closed
+
+    # 1) MakeHigh END: endRedLow belgilangan bo'lsa va intrabar low uni buzsa
+    if st.state == "IN_MAKE_HIGH" and st.endRedLow is not None:
+        if current.l < st.endRedLow:
+            st.state = "IN_PULLBACK"
+            # endRedLow end bo'ldi, pullback boshlandi
+
+    # 2) Pullback invalidation: pullback makeHighStartLow dan pastga tushmasin
+    if st.state == "IN_PULLBACK" and st.makeHighStartLow is not None:
+        if current.l < st.makeHighStartLow:
+            reset_setup(st)
+            return
+
+    # 3) BUY: Pullback ichida last_closed.high break (intrabar)
+    if st.state == "IN_PULLBACK":
+        if lc is None:
+            return
+        if current.h > lc.h:
+            st.state = "IN_BUY"
+            st.cycle_no += 1
+            st.last_buy_ts = current.t
+            st.sell_ref_low = lc.l  # start reference
+            await tg_send(
+                f"🟢 <b>{st.cycle_no} BUY</b>\n"
+                f"📌 <b>{symbol}</b> | TF {INTERVAL}\n"
+                f"Break: last_closed.high = <b>{lc.h}</b>\n"
+                f"Pullback OK (min > makeHighStartLow)"
+            )
+            return
+
+    # 4) SELL: BUY dan keyin last_closed.low break (intrabar)
+    if st.state == "IN_BUY":
+        ref = st.sell_ref_low if st.sell_ref_low is not None else (lc.l if lc else None)
+        if ref is None:
+            return
+        if current.l < ref:
+            st.last_sell_ts = current.t
+            await tg_send(
+                f"🔴 <b>{st.cycle_no} SELL</b>\n"
+                f"📌 <b>{symbol}</b> | TF {INTERVAL}\n"
+                f"Break: ref_low = <b>{ref}</b>"
+            )
+            # SELL dan keyin qaytadan setup qidiramiz
+            reset_setup(st)
+            return
+
+# ===================== BINANCE WS =====================
+def build_stream_url() -> str:
+    # combined streams
+    streams = "/".join([f"{s.lower()}@kline_{INTERVAL}" for s in SYMBOLS])
+    return f"{BINANCE_WS_BASE}/stream?streams={streams}"
+
+async def ws_loop():
+    url = build_stream_url()
+    log.info("WS URL: %s", url)
+
+    last_log = 0.0
     while True:
         try:
-            now = time.time()
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(url, heartbeat=30) as ws:
+                    log.info("WS connected")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            payload = data.get("data", {})
+                            k = payload.get("k", {})
+                            symbol = (k.get("s") or "").upper()
+                            if symbol not in STATES:
+                                continue
 
-            # refresh universe
-            if (not symbols) or (now - last_refresh > SPOT_REFRESH_SECONDS):
-                symbols = load_usdt_spot_symbols()
-                last_refresh = now
-                scan_index = 0
-                print(f"[INFO] symbols loaded: {len(symbols)}")
+                            cndl = Candle(
+                                t=int(k.get("t", 0)),
+                                o=float(k.get("o", 0)),
+                                h=float(k.get("h", 0)),
+                                l=float(k.get("l", 0)),
+                                c=float(k.get("c", 0)),
+                                is_final=bool(k.get("x", False)),
+                            )
 
-            if not symbols:
-                time.sleep(POLL_SECONDS)
-                continue
+                            # intrabar tekshiruv
+                            await maybe_trigger_events(symbol, cndl)
 
-            # batch
-            batch = []
-            for _ in range(min(SCAN_BATCH_SIZE, len(symbols))):
-                batch.append(symbols[scan_index])
-                scan_index = (scan_index + 1) % len(symbols)
+                            # close event
+                            if cndl.is_final:
+                                on_candle_close(symbol, cndl)
 
-            for sym in batch:
-                # cooldown
-                if (now - last_sent.get(sym, 0.0)) < COOLDOWN_SECONDS:
-                    continue
+                            # optional heartbeat log
+                            if SCAN_LOG_EVERY_SEC > 0:
+                                now = time.time()
+                                if now - last_log >= SCAN_LOG_EVERY_SEC:
+                                    st = STATES[symbol]
+                                    log.info("[%s] state=%s cycle=%s", symbol, st.state, st.cycle_no)
+                                    last_log = now
 
-                # volume filter
-                if MIN_QUOTE_VOL and MIN_QUOTE_VOL > 0:
-                    qv = get_24h_quote_volume(sym)
-                    if qv is None or qv < MIN_QUOTE_VOL:
-                        continue
-
-                high_4h = get_4h_high(sym)
-                if not high_4h:
-                    continue
-
-                price = get_last_price(sym)
-                if not price:
-                    continue
-
-                remain_pct = ((high_4h - price) / high_4h) * 100.0
-
-                # 0..TRIGGER_PCT ichida bo'lsa -> signal
-                if 0 <= remain_pct <= TRIGGER_PCT:
-                    ticker = to_ticker(sym)
-                    tg_send(ticker)  # ✅ faqat ticker (BTC)
-                    last_sent[sym] = now
-                    print(f"[HIT] {sym} remain={remain_pct:.4f}%")
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            break
 
         except Exception as e:
-            print("[ERROR]", e)
+            log.warning("WS error, reconnecting: %s", e)
+            await asyncio.sleep(3)
 
-        time.sleep(POLL_SECONDS)
+# ===================== MAIN =====================
+async def on_startup(app_: Application):
+    await tg_send("✅ Bot ishga tushdi (polling)")
 
+async def main():
+    app.post_init = on_startup
+    # ws background task
+    asyncio.get_running_loop().create_task(ws_loop())
+    # polling (Render uchun eng oson va barqaror)
+    await app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
